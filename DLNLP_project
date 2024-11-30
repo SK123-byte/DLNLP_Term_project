@@ -1,0 +1,746 @@
+''' DOCUMENT CLASSIFICATION '''
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from transformers import BartTokenizer, BartModel, GPT2Tokenizer, GPT2Model, T5Tokenizer, T5ForConditionalGeneration, BertTokenizer, BertForSequenceClassification
+
+# Custom Dataset Class
+class SST2Dataset(Dataset):
+    def __init__(self, texts, labels, tokenizer, max_len):
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, index):
+        text = self.texts[index]
+        label = self.labels[index]
+        encoding = self.tokenizer(
+            text,
+            max_length=self.max_len,
+            padding='max_length',
+            truncation=True,
+            return_tensors="pt"
+        )
+        return {
+            'input_ids': encoding['input_ids'].squeeze(0),
+            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'label': torch.tensor(label, dtype=torch.long)
+        }
+
+# Load SST-2 dataset
+from datasets import load_dataset
+dataset = load_dataset("glue", "sst2")
+train_texts, train_labels = dataset['train']['sentence'], dataset['train']['label']
+val_texts, val_labels = dataset['validation']['sentence'], dataset['validation']['label']
+
+# Create Datasets and DataLoaders
+max_len = 64
+batch_size = 16
+
+tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
+train_dataset = SST2Dataset(train_texts, train_labels, tokenizer, max_len)
+val_dataset = SST2Dataset(val_texts, val_labels, tokenizer, max_len)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# BART Model
+class BARTForClassification(nn.Module):
+    def __init__(self, num_labels):
+        super(BARTForClassification, self).__init__()
+        self.bart = BartModel.from_pretrained("facebook/bart-base")
+        self.dropout = nn.Dropout(0.3)
+        self.classifier = nn.Linear(self.bart.config.hidden_size, num_labels)
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bart(input_ids=input_ids, attention_mask=attention_mask)
+        pooled_output = outputs.last_hidden_state[:, 0, :]  
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
+        return logits
+
+# GPT2 Model
+class GPT2ForClassification(nn.Module):
+    def __init__(self, num_labels):
+        super(GPT2ForClassification, self).__init__()
+        self.gpt2 = GPT2Model.from_pretrained("gpt2")
+        self.dropout = nn.Dropout(0.3)
+        self.classifier = nn.Linear(self.gpt2.config.hidden_size, num_labels)
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.gpt2(input_ids=input_ids, attention_mask=attention_mask)
+        pooled_output = outputs.last_hidden_state[:, -1, :]  
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
+        return logits
+
+# T5 Model
+class T5ForClassification(nn.Module):
+    def __init__(self, num_labels):
+        super(T5ForClassification, self).__init__()
+        self.t5 = T5ForConditionalGeneration.from_pretrained("t5-base")
+        self.dropout = nn.Dropout(0.3)
+        self.classifier = nn.Linear(self.t5.config.d_model, num_labels)
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.t5.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        pooled_output = outputs.last_hidden_state[:, 0, :]  
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
+        return logits
+
+# BERT Model
+class BERTForClassification(nn.Module):
+    def __init__(self, num_labels):
+        super(BERTForClassification, self).__init__()
+        self.bert = BertForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=num_labels)
+        self.dropout = nn.Dropout(0.3)
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits
+        return logits
+
+# Define the model, loss function, and optimizer for BERT, GPT2, and T5
+models = {
+    'BART': BARTForClassification(num_labels=2).to(device),
+    'GPT2': GPT2ForClassification(num_labels=2).to(device),
+    'T5': T5ForClassification(num_labels=2).to(device),
+    'BERT': BERTForClassification(num_labels=2).to(device)
+}
+
+tokenizers = {
+    'BART': BartTokenizer.from_pretrained("facebook/bart-base"),
+    'GPT2': GPT2Tokenizer.from_pretrained("gpt2"),
+    'T5': T5Tokenizer.from_pretrained("t5-base"),
+    'BERT': BertTokenizer.from_pretrained("bert-base-uncased")
+}
+
+# Loss function and optimizer
+criterion = nn.CrossEntropyLoss()
+optimizers = {model_name: optim.AdamW(models[model_name].parameters(), lr=2e-5) for model_name in models}
+
+# Training and Evaluation Functions 
+def train_epoch(model, data_loader, optimizer, criterion, device):
+    model.train()
+    total_loss, correct = 0, 0
+    for batch in data_loader:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['label'].to(device)
+
+        optimizer.zero_grad()
+        logits = model(input_ids, attention_mask)
+        loss = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        correct += (logits.argmax(1) == labels).sum().item()
+
+    accuracy = correct / len(data_loader.dataset)
+    return total_loss / len(data_loader), accuracy
+
+def evaluate_model(model, data_loader, criterion, device):
+    model.eval()
+    total_loss, correct = 0, 0
+    with torch.no_grad():
+        for batch in data_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['label'].to(device)
+
+            logits = model(input_ids, attention_mask)
+            loss = criterion(logits, labels)
+            total_loss += loss.item()
+            correct += (logits.argmax(1) == labels).sum().item()
+
+    accuracy = correct / len(data_loader.dataset)
+    return total_loss / len(data_loader), accuracy
+
+# Training Loop
+num_epochs = 3
+for epoch in range(num_epochs):
+    print(f"Epoch {epoch + 1}/{num_epochs}")
+    for model_name in models:
+        model = models[model_name]
+        optimizer = optimizers[model_name]
+        print(f"Training {model_name} model:")
+        train_loss, train_accuracy = train_epoch(model, train_loader, optimizer, criterion, device)
+        val_loss, val_accuracy = evaluate_model(model, val_loader, criterion, device)
+
+        print(f"Train Loss: {train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}")
+        print(f"Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_accuracy:.4f}")
+
+# Calculate Inference Time for all models
+import time
+for model_name in models:
+    model = models[model_name]
+    model.eval()
+    start_time = time.time()
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            logits = model(input_ids, attention_mask)
+    end_time = time.time()
+
+    inference_time = end_time - start_time
+    print(f"Inference Time for {model_name} model on Validation Set: {inference_time:.2f} seconds")
+
+############################################################################################################################################################################
+
+
+''''  QUESTION ANSWERING    '''
+
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from transformers import (
+    BartTokenizer, BartForQuestionAnswering,
+    GPT2Tokenizer, GPT2ForQuestionAnswering,
+    T5Tokenizer, T5ForConditionalGeneration,
+    BertTokenizer, BertForQuestionAnswering
+)
+from datasets import load_dataset
+
+# Custom Dataset Class
+class SQUADDataset(Dataset):
+    def __init__(self, contexts, questions, answers, tokenizer, max_len):
+        self.contexts = contexts
+        self.questions = questions
+        self.answers = answers
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.contexts)
+
+    def __getitem__(self, index):
+        context = self.contexts[index]
+        question = self.questions[index]
+        answer = self.answers[index]
+        
+        encoding = self.tokenizer(
+            question,
+            context,
+            max_length=self.max_len,
+            padding='max_length',
+            truncation=True,
+            return_tensors="pt"
+        )
+
+        start_position = encoding.char_to_token(answer['answer_start'])
+        end_position = encoding.char_to_token(answer['answer_end'] - 1)
+        
+        return {
+            'input_ids': encoding['input_ids'].squeeze(0),
+            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'start_positions': torch.tensor(start_position, dtype=torch.long),
+            'end_positions': torch.tensor(end_position, dtype=torch.long)
+        }
+
+# Load SQUAD dataset
+dataset = load_dataset("squad")
+train_contexts, train_questions, train_answers = dataset['train']['context'], dataset['train']['question'], dataset['train']['answers']
+val_contexts, val_questions, val_answers = dataset['validation']['context'], dataset['validation']['question'], dataset['validation']['answers']
+
+# Create Datasets and DataLoaders
+max_len = 384
+batch_size = 16
+
+tokenizer = {
+    'BART': BartTokenizer.from_pretrained("facebook/bart-large"),
+    'GPT2': GPT2Tokenizer.from_pretrained("gpt2"),
+    'T5': T5Tokenizer.from_pretrained("t5-base"),
+    'BERT': BertTokenizer.from_pretrained("bert-large-uncased-whole-word-masking-finetuned-squad")
+}
+
+train_dataset = SQUADDataset(train_contexts, train_questions, train_answers, tokenizer['BERT'], max_len)  # Use BERT tokenizer for all models
+val_dataset = SQUADDataset(val_contexts, val_questions, val_answers, tokenizer['BERT'], max_len)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size)
+
+# Define Models for QA Task
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# BERT Model for QA
+class BERTForQA(nn.Module):
+    def __init__(self):
+        super(BERTForQA, self).__init__()
+        self.bert = BertForQuestionAnswering.from_pretrained("bert-large-uncased-whole-word-masking-finetuned-squad")
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        start_logits, end_logits = outputs.start_logits, outputs.end_logits
+        return start_logits, end_logits
+
+# GPT-2 Model for QA
+class GPT2ForQA(nn.Module):
+    def __init__(self):
+        super(GPT2ForQA, self).__init__()
+        self.gpt2 = GPT2ForQuestionAnswering.from_pretrained("gpt2")
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.gpt2(input_ids=input_ids, attention_mask=attention_mask)
+        start_logits, end_logits = outputs.start_logits, outputs.end_logits
+        return start_logits, end_logits
+
+# T5 Model for QA
+class T5ForQA(nn.Module):
+    def __init__(self):
+        super(T5ForQA, self).__init__()
+        self.t5 = T5ForConditionalGeneration.from_pretrained("t5-base")
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.t5(input_ids=input_ids, attention_mask=attention_mask)
+        start_logits, end_logits = outputs.start_logits, outputs.end_logits
+        return start_logits, end_logits
+
+# BART Model for QA
+class BARTForQA(nn.Module):
+    def __init__(self):
+        super(BARTForQA, self).__init__()
+        self.bart = BartForQuestionAnswering.from_pretrained("facebook/bart-large")
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bart(input_ids=input_ids, attention_mask=attention_mask)
+        start_logits, end_logits = outputs.start_logits, outputs.end_logits
+        return start_logits, end_logits
+
+# Instantiate all models
+models = {
+    'BERT': BERTForQA().to(device),
+    'GPT2': GPT2ForQA().to(device),
+    'T5': T5ForQA().to(device),
+    'BART': BARTForQA().to(device)
+}
+
+# Optimizers
+optimizers = {
+    model_name: optim.AdamW(models[model_name].parameters(), lr=2e-5)
+    for model_name in models
+}
+
+# Define Exact Match (EM) Calculation Function
+def exact_match(start_logits, end_logits, start_positions, end_positions):
+    start_preds = torch.argmax(start_logits, dim=1)
+    end_preds = torch.argmax(end_logits, dim=1)
+    
+    em = ((start_preds == start_positions) & (end_preds == end_positions)).float().mean()
+    return em.item()
+
+# Training and Evaluation Functions for QA
+def train_epoch(model, data_loader, optimizer, criterion, device):
+    model.train()
+    total_loss, total_em = 0, 0
+    for batch in data_loader:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        start_positions = batch['start_positions'].to(device)
+        end_positions = batch['end_positions'].to(device)
+
+        optimizer.zero_grad()
+        start_logits, end_logits = model(input_ids, attention_mask)
+        loss = criterion(start_logits, start_positions) + criterion(end_logits, end_positions)
+        loss.backward()
+        optimizer.step()
+
+        em = exact_match(start_logits, end_logits, start_positions, end_positions)
+        total_loss += loss.item()
+        total_em += em
+
+    return total_loss / len(data_loader), total_em / len(data_loader)
+
+def evaluate_model(model, data_loader, criterion, device):
+    model.eval()
+    total_loss, total_em = 0, 0
+    with torch.no_grad():
+        for batch in data_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            start_positions = batch['start_positions'].to(device)
+            end_positions = batch['end_positions'].to(device)
+
+            start_logits, end_logits = model(input_ids, attention_mask)
+            loss = criterion(start_logits, start_positions) + criterion(end_logits, end_positions)
+            
+            em = exact_match(start_logits, end_logits, start_positions, end_positions)
+            total_loss += loss.item()
+            total_em += em
+
+    return total_loss / len(data_loader), total_em / len(data_loader)
+
+# Training Loop
+num_epochs = 3
+for epoch in range(num_epochs):
+    print(f"Epoch {epoch + 1}/{num_epochs}")
+    for model_name in models:
+        model = models[model_name]
+        optimizer = optimizers[model_name]
+        print(f"Training {model_name} model:")
+        criterion = nn.CrossEntropyLoss()
+
+        train_loss, train_em = train_epoch(model, train_loader, optimizer, criterion, device)
+        val_loss, val_em = evaluate_model(model, val_loader, criterion, device)
+
+        print(f"Train Loss: {train_loss:.4f}, Train EM: {train_em:.4f}")
+        print(f"Validation Loss: {val_loss:.4f}, Validation EM: {val_em:.4f}")
+
+# Calculate Inference Time for all models
+import time
+for model_name in models:
+    model = models[model_name]
+    model.eval()
+    start_time = time.time()
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            start_logits, end_logits = model(input_ids, attention_mask)
+    end_time = time.time()
+
+    inference_time = end_time - start_time
+    print(f"Inference Time for {model_name} model on Validation Set: {inference_time:.2f} seconds")
+
+
+############################################################################################################################################################################
+
+
+'''  NATURAL LANGUAGE INFERENCE  '''
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from transformers import BartTokenizer, BartForSequenceClassification, BertTokenizer, BertForSequenceClassification
+from transformers import GPT2Tokenizer, GPT2ForSequenceClassification
+from transformers import T5Tokenizer, T5ForSequenceClassification
+from datasets import load_dataset
+
+# Custom Dataset Class for SNLI
+class NLI_Dataset(Dataset):
+    def __init__(self, premise, hypothesis, labels, tokenizer, max_len):
+        self.premise = premise
+        self.hypothesis = hypothesis
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.premise)
+
+    def __getitem__(self, index):
+        premise = self.premise[index]
+        hypothesis = self.hypothesis[index]
+        label = self.labels[index]
+        encoding = self.tokenizer(
+            premise,
+            hypothesis,
+            max_length=self.max_len,
+            padding='max_length',
+            truncation=True,
+            return_tensors="pt"
+        )
+        return {
+            'input_ids': encoding['input_ids'].squeeze(0),
+            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'label': torch.tensor(label, dtype=torch.long)
+        }
+
+# Load SNLI dataset
+dataset = load_dataset("snli")
+train_premise, train_hypothesis, train_labels = dataset['train']['premise'], dataset['train']['hypothesis'], dataset['train']['label']
+val_premise, val_hypothesis, val_labels = dataset['validation']['premise'], dataset['validation']['hypothesis'], dataset['validation']['label']
+
+# Define the models and tokenizers
+models = {
+    "BERT": {
+        "tokenizer": BertTokenizer.from_pretrained('bert-base-uncased'),
+        "model": BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=3)
+    },
+    "T5": {
+        "tokenizer": T5Tokenizer.from_pretrained('t5-base'),
+        "model": T5ForSequenceClassification.from_pretrained('t5-base', num_labels=3)
+    },
+    "GPT2": {
+        "tokenizer": GPT2Tokenizer.from_pretrained('gpt2'),
+        "model": GPT2ForSequenceClassification.from_pretrained('gpt2', num_labels=3)
+    },
+    "BART": {
+        "tokenizer": BartTokenizer.from_pretrained('facebook/bart-base'),
+        "model": BartForSequenceClassification.from_pretrained('facebook/bart-base', num_labels=3)
+    }
+}
+
+# Hyperparameters
+max_len = 128
+batch_size = 16
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Create Dataset and DataLoader for training and validation
+train_dataset = NLI_Dataset(train_premise, train_hypothesis, train_labels, tokenizer=None, max_len=max_len)
+val_dataset = NLI_Dataset(val_premise, val_hypothesis, val_labels, tokenizer=None, max_len=max_len)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size)
+
+# Function to train and evaluate each model
+def train_epoch(model, data_loader, optimizer, criterion, device):
+    model.train()
+    total_loss, correct = 0, 0
+    for batch in data_loader:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['label'].to(device)
+
+        optimizer.zero_grad()
+        logits = model(input_ids, attention_mask=attention_mask).logits
+        loss = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        correct += (logits.argmax(1) == labels).sum().item()
+
+    accuracy = correct / len(data_loader.dataset)
+    return total_loss / len(data_loader), accuracy
+
+def evaluate_model(model, data_loader, criterion, device):
+    model.eval()
+    total_loss, correct = 0, 0
+    with torch.no_grad():
+        for batch in data_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['label'].to(device)
+
+            logits = model(input_ids, attention_mask=attention_mask).logits
+            loss = criterion(logits, labels)
+            total_loss += loss.item()
+            correct += (logits.argmax(1) == labels).sum().item()
+
+    accuracy = correct / len(data_loader.dataset)
+    return total_loss / len(data_loader), accuracy
+
+# Loop through the models
+for model_name, model_info in models.items():
+    print(f"Training {model_name}...")
+
+    tokenizer = model_info["tokenizer"]
+    model = model_info["model"]
+    model.to(device)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=2e-5)
+    criterion = nn.CrossEntropyLoss()
+
+    # Create Dataset and DataLoader for this specific model
+    train_dataset = NLI_Dataset(train_premise, train_hypothesis, train_labels, tokenizer, max_len)
+    val_dataset = NLI_Dataset(val_premise, val_hypothesis, val_labels, tokenizer, max_len)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+
+    # Training Loop for each model
+    num_epochs = 3
+    for epoch in range(num_epochs):
+        print(f"Epoch {epoch + 1}/{num_epochs}")
+        train_loss, train_accuracy = train_epoch(model, train_loader, optimizer, criterion, device)
+        val_loss, val_accuracy = evaluate_model(model, val_loader, criterion, device)
+
+        print(f"Train Loss: {train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}")
+        print(f"Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_accuracy:.4f}")
+
+    # Calculate Inference Time for this model
+    import time
+    model.eval()
+    start_time = time.time()
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            logits = model(input_ids, attention_mask=attention_mask).logits
+    end_time = time.time()
+
+    inference_time = end_time - start_time
+    print(f"Inference Time for Validation Set: {inference_time:.2f} seconds\n")
+
+
+############################################################################################################################################################################
+
+''' TEXT SUMMARIZATION '''
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from transformers import BartTokenizer, BartForConditionalGeneration, BertTokenizer, BertForSequenceClassification
+from transformers import GPT2Tokenizer, GPT2ForSequenceClassification
+from transformers import T5Tokenizer, T5ForConditionalGeneration
+from datasets import load_dataset
+
+# Custom Dataset Class for Summarization
+class SummarizationDataset(Dataset):
+    def __init__(self, articles, summaries, tokenizer, max_len):
+        self.articles = articles
+        self.summaries = summaries
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.articles)
+
+    def __getitem__(self, index):
+        article = self.articles[index]
+        summary = self.summaries[index]
+        encoding = self.tokenizer(
+            article,
+            summary,
+            max_length=self.max_len,
+            padding='max_length',
+            truncation=True,
+            return_tensors="pt"
+        )
+        return {
+            'input_ids': encoding['input_ids'].squeeze(0),
+            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'labels': encoding['labels'].squeeze(0)
+        }
+
+# Load CNN/DailyMail dataset
+dataset = load_dataset("cnn_dailymail", "3.0.0")
+train_articles, train_summaries = dataset['train']['article'], dataset['train']['highlights']
+val_articles, val_summaries = dataset['validation']['article'], dataset['validation']['highlights']
+
+# Define the models and tokenizers
+models = {
+    "BERT": {
+        "tokenizer": BertTokenizer.from_pretrained('bert-base-uncased'),
+        "model": BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=2)
+    },
+    "T5": {
+        "tokenizer": T5Tokenizer.from_pretrained('t5-base'),
+        "model": T5ForConditionalGeneration.from_pretrained('t5-base')
+    },
+    "GPT2": {
+        "tokenizer": GPT2Tokenizer.from_pretrained('gpt2'),
+        "model": GPT2ForSequenceClassification.from_pretrained('gpt2', num_labels=2)
+    },
+    "BART": {
+        "tokenizer": BartTokenizer.from_pretrained('facebook/bart-large-cnn'),
+        "model": BartForConditionalGeneration.from_pretrained('facebook/bart-large-cnn')
+    }
+}
+
+# Hyperparameters
+max_len = 512
+batch_size = 4  # Summarization tasks typically require smaller batch sizes due to large sequences
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Create Dataset and DataLoader for training and validation
+train_dataset = SummarizationDataset(train_articles, train_summaries, tokenizer=None, max_len=max_len)
+val_dataset = SummarizationDataset(val_articles, val_summaries, tokenizer=None, max_len=max_len)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size)
+
+# Function to train and evaluate each model
+def train_epoch(model, data_loader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0
+    for batch in data_loader:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+
+        optimizer.zero_grad()
+        outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+        loss = outputs.loss
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss / len(data_loader)
+
+def evaluate_model(model, data_loader, device):
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for batch in data_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+
+            outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+            loss = outputs.loss
+            total_loss += loss.item()
+
+    return total_loss / len(data_loader)
+
+# Loop through the models
+for model_name, model_info in models.items():
+    print(f"Training {model_name}...")
+
+    tokenizer = model_info["tokenizer"]
+    model = model_info["model"]
+    model.to(device)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=2e-5)
+    criterion = nn.CrossEntropyLoss()
+
+    # Create Dataset and DataLoader for this specific model
+    train_dataset = SummarizationDataset(train_articles, train_summaries, tokenizer, max_len)
+    val_dataset = SummarizationDataset(val_articles, val_summaries, tokenizer, max_len)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+
+    # Training Loop for each model
+    num_epochs = 3
+    for epoch in range(num_epochs):
+        print(f"Epoch {epoch + 1}/{num_epochs}")
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
+        val_loss = evaluate_model(model, val_loader, device)
+
+        print(f"Train Loss: {train_loss:.4f}")
+        print(f"Validation Loss: {val_loss:.4f}")
+
+    # Inference Example (Generating Summaries for Validation Set)
+    model.eval()
+    print(f"Generating Summaries for {model_name}...")
+    for batch in val_loader:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+
+        # Generate summaries using the model
+        summary_ids = model.generate(input_ids, attention_mask=attention_mask, num_beams=4, max_length=150, early_stopping=True)
+
+        # Decode generated summary
+        generated_summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+        print(f"Generated Summary: {generated_summary}\n")
+
+    # Calculate Inference Time for this model
+    import time
+    start_time = time.time()
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            summary_ids = model.generate(input_ids, attention_mask=attention_mask, num_beams=4, max_length=150)
+    end_time = time.time()
+
+    inference_time = end_time - start_time
+    print(f"Inference Time for Validation Set: {inference_time:.2f} seconds\n")
+
